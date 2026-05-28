@@ -1,0 +1,12 @@
+data/
+*.zip
+*.tar*
+*.7z
+*.gz
+*.bz2
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
