@@ -16,11 +16,16 @@ from models import PanCancerModel, FocalLoss
 # ARGS
 # ─────────────────────────────
 parser = argparse.ArgumentParser()
-parser.add_argument("--cancer",         required=True)
+parser.add_argument("--cancer",         required=True,
+                    choices=["BRCA", "COAD", "GBM", "LGG", "OV"],
+                    help="Cancer type — must match the *_graph.pt file produced by prepare_graph.py.")
 parser.add_argument("--data_path",      required=True)
 parser.add_argument("--epochs",         type=int,   default=150)
 parser.add_argument("--nhid",           type=int,   default=64)
-parser.add_argument("--num_classes",    type=int,   default=5)
+parser.add_argument("--num_classes",    type=int,   default=0,
+                    help="Number of output classes. "
+                         "0 = auto-detect from data (strongly recommended). "
+                         "BRCA/GBM=5, COAD/OV=4, LGG=3.")
 parser.add_argument("--dropout_ratio",  type=float, default=0.3)
 parser.add_argument("--lr",             type=float, default=5e-4)
 parser.add_argument("--weight_decay",   type=float, default=5e-4)
@@ -50,15 +55,9 @@ def load_graph():
 def train(model, data, optimizer, criterion, mask):
     model.train()
 
-    # FIX Bug 2: explicit key access — robust against dict insertion order changes
-    d1 = data['mRNA']
-    d2 = data['miRNA']
-    d3 = data['Methy']
-    d4 = data['CNV']
+    d1, d2, d3, d4 = data['mRNA'], data['miRNA'], data['Methy'], data['CNV']
 
     optimizer.zero_grad()
-
-    # FIX Bug 1: model returns (logits, entropy) — unpack correctly
     logits, entropy = model(d1, d2, d3, d4)
 
     mask = mask.to(logits.device)
@@ -66,8 +65,8 @@ def train(model, data, optimizer, criterion, mask):
 
     focal_loss = criterion(logits[mask], y[mask])
 
-    # FIX Bug 1 (entropy sign): SUBTRACT entropy to MAXIMIZE it.
-    # Goal: encourage uniform attention across 4 omics → prevent modality collapse.
+    # Maximize entropy → subtract from loss.
+    # Goal: prevent attention from collapsing onto a single omic modality.
     loss = focal_loss - args.entropy_weight * entropy
 
     loss.backward()
@@ -78,23 +77,22 @@ def train(model, data, optimizer, criterion, mask):
 
 
 # ─────────────────────────────
-# TEST
+# EVALUATE (works for any mask: val or test)
 # ─────────────────────────────
-def test(model, data, mask):
+def evaluate(model, data, mask):
+    """
+    Renamed from test() → evaluate() to be explicit about what mask is used.
+    Call with val_mask during training (checkpoint selection).
+    Call with test_mask for final reporting only.
+    """
     model.eval()
 
-    # FIX Bug 2: explicit key access
-    d1 = data['mRNA']
-    d2 = data['miRNA']
-    d3 = data['Methy']
-    d4 = data['CNV']
+    d1, d2, d3, d4 = data['mRNA'], data['miRNA'], data['Methy'], data['CNV']
 
     with torch.no_grad():
-        # FIX Bug 1: unpack tuple correctly
         logits, _ = model(d1, d2, d3, d4)
         pred      = logits.argmax(dim=1)
 
-    # Force CPU before numpy/sklearn
     y    = d1.y.cpu()
     pred = pred.cpu()
     mask = mask.cpu()
@@ -111,9 +109,9 @@ def test(model, data, mask):
 # RUN ONE SEED
 # ─────────────────────────────
 def run_one_seed(seed):
-    print(f"\n{'='*45}")
+    print(f"\n{'='*50}")
     print(f"  Seed {seed}")
-    print(f"{'='*45}")
+    print(f"{'='*50}")
     set_seed(seed)
 
     data   = load_graph()
@@ -125,7 +123,7 @@ def run_one_seed(seed):
 
     model = PanCancerModel(args, data).to(device)
 
-    # Class weights (balanced) — clamp to avoid extreme gradients with minority class
+    # Class weights (balanced, clamped to avoid extreme gradients)
     y_np    = data["mRNA"].y.cpu().numpy()
     classes = np.unique(y_np)
     w       = compute_class_weight("balanced", classes=classes, y=y_np)
@@ -138,73 +136,87 @@ def run_one_seed(seed):
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
 
+    # FIX #1: CosineAnnealingLR scheduler — zero-risk, high impact.
+    # Decays LR smoothly from args.lr → eta_min over T_max epochs.
+    # Avoids plateau in the flat region of constant LR.
+    # Typically adds +0.01–0.03 macro-F1 with no other changes.
+    # T_max = args.epochs: one full cosine cycle (no restarts).
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=1e-6
+    )
+
     train_mask = data["mRNA"].train_mask.to(device)
+    val_mask   = data["mRNA"].val_mask.to(device)     # FIX #2: val_mask from 70/10/20 split
     test_mask  = data["mRNA"].test_mask.to(device)
 
-    best_f1    = 0.0
-    last_k     = []   # last-10 logits for ensemble
-    f1_history = []   # ← F1 theo từng epoch để plot
+    best_val_f1       = 0.0
+    last_k_logits     = []        # last-10 epochs for ensemble (on full graph)
+    val_f1_history    = []        # per-epoch val F1 for plot
 
-    # FIX Bug 3: create checkpoint directory and save best model per seed
     ckpt_dir  = os.path.join(args.data_path, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
     ckpt_path = os.path.join(ckpt_dir, f"{args.cancer}_seed{seed}_best.pth")
 
     for epoch in range(args.epochs):
         loss, focal = train(model, data, optimizer, criterion, train_mask)
-        acc, f1, logits_cpu, attn = test(model, data, test_mask)
+        scheduler.step()    # advance LR schedule after each epoch
 
-        # ← Ghi lại F1 sau mỗi epoch
-        f1_history.append(f1)
+        # FIX #2: Evaluate on VAL for checkpoint selection (no test leakage).
+        # Also monitor test for logging — but checkpoint is driven by val F1.
+        val_acc,  val_f1,  _,          _    = evaluate(model, data, val_mask)
+        test_acc, test_f1, logits_cpu,  attn = evaluate(model, data, test_mask)
 
-        # FIX Bug 3: save best checkpoint when F1 improves
-        if f1 > best_f1:
-            best_f1 = f1
+        val_f1_history.append(val_f1)
+
+        # Save checkpoint when VAL F1 improves (not test F1)
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
             torch.save({
                 'epoch':             epoch,
                 'model_state_dict':  model.state_dict(),
-                'f1':                f1,
-                'acc':               acc,
+                'val_f1':            val_f1,
+                'test_f1':           test_f1,    # informational only, not used for selection
                 'args':              vars(args),
                 'attention_weights': attn,
                 'y':                 data['mRNA'].y.cpu(),
                 'omics_names':       ['mRNA', 'miRNA', 'Methy', 'CNV'],
             }, ckpt_path)
 
-        # Collect last 10 epochs for ensemble
+        # Collect last 10 epochs for cross-seed ensemble
         if epoch >= args.epochs - 10:
-            last_k.append(logits_cpu)
+            last_k_logits.append(logits_cpu)
 
         if epoch % 10 == 0:
+            lr_now = scheduler.get_last_lr()[0]
             print(f"  Ep {epoch:3d} | loss={loss:.4f} focal={focal:.4f} | "
-                  f"acc={acc:.4f} macro-F1={f1:.4f}")
+                  f"val_acc={val_acc:.4f} val_F1={val_f1:.4f} | "
+                  f"test_acc={test_acc:.4f} test_F1={test_f1:.4f} | "
+                  f"lr={lr_now:.2e}")
 
-    print(f"  → Best macro-F1 (seed {seed}): {best_f1:.4f}")
+    print(f"  → Best val macro-F1 (seed {seed}): {best_val_f1:.4f}")
     print(f"  → Checkpoint saved: {ckpt_path}")
 
-    # ── Plot F1 curve cho seed này ──────────────────────────────────────
+    # ── Val F1 curve for this seed ───────────────────────────────────────
     plt.figure(figsize=(8, 4))
-    plt.plot(f1_history, linewidth=1.5, color='steelblue')
+    plt.plot(val_f1_history, linewidth=1.5, color='steelblue', label='Val Macro-F1')
 
-    # Đánh dấu epoch tốt nhất
-    best_epoch = int(np.argmax(f1_history))
+    best_epoch = int(np.argmax(val_f1_history))
     plt.axvline(x=best_epoch, color='tomato', linestyle='--', linewidth=1,
-                label=f'Best epoch {best_epoch} (F1={best_f1:.4f})')
+                label=f'Best epoch {best_epoch} (val F1={best_val_f1:.4f})')
 
     plt.xlabel('Epoch')
-    plt.ylabel('Test Macro-F1')
-    plt.title(f'{args.cancer} — Seed {seed}')
+    plt.ylabel('Val Macro-F1')
+    plt.title(f'{args.cancer} — Seed {seed} (val)')
     plt.legend(fontsize=9)
     plt.tight_layout()
 
     plot_path = os.path.join(args.data_path, f"f1_curve_{args.cancer}_seed{seed}.png")
     plt.savefig(plot_path, dpi=120)
     plt.close()
-    print(f"  → F1 curve saved: {plot_path}")
-    # ────────────────────────────────────────────────────────────────────
+    print(f"  → Val F1 curve saved: {plot_path}")
 
-    ensemble_logits = torch.stack(last_k).mean(dim=0)  # [N, C]
-    return ensemble_logits, data, f1_history
+    ensemble_logits = torch.stack(last_k_logits).mean(dim=0)   # [N, C]
+    return ensemble_logits, data, val_f1_history
 
 
 # ─────────────────────────────
@@ -212,9 +224,20 @@ def run_one_seed(seed):
 # ─────────────────────────────
 if __name__ == "__main__":
 
+    # Auto-detect num_classes from graph file.
+    # Critical: avoids RuntimeError in FocalLoss for COAD/OV (4 classes) and LGG (3 classes)
+    # when a hard-coded num_classes=5 was used previously.
+    if args.num_classes == 0:
+        _tmp = load_graph()
+        args.num_classes = int(_tmp["mRNA"].y.max().item()) + 1
+        del _tmp
+
+    print(f"\n  Cancer      : {args.cancer}")
+    print(f"  num_classes : {args.num_classes}  (BRCA/GBM=5, COAD/OV=4, LGG=3)")
+
     seeds         = [777, 42, 1234, 2024, 999]
     all_logits    = []
-    all_f1_curves = []   # ← tất cả F1 curves để plot tổng
+    all_f1_curves = []
     final_data    = None
 
     for s in seeds:
@@ -223,21 +246,20 @@ if __name__ == "__main__":
         all_f1_curves.append(f1_hist)
         final_data = data
 
-    # ── Plot tổng: tất cả 5 seeds trên cùng 1 figure ───────────────────
+    # ── Summary plot: all 5 seeds val F1 curves ─────────────────────────
     plt.figure(figsize=(10, 5))
     colors = ['steelblue', 'darkorange', 'seagreen', 'mediumpurple', 'crimson']
     for idx, (hist, seed) in enumerate(zip(all_f1_curves, seeds)):
         plt.plot(hist, linewidth=1.2, alpha=0.8,
                  color=colors[idx], label=f'Seed {seed}')
 
-    # Mean curve
     mean_curve = np.mean(all_f1_curves, axis=0)
     plt.plot(mean_curve, linewidth=2.5, color='black',
              linestyle='--', label='Mean')
 
     plt.xlabel('Epoch')
-    plt.ylabel('Test Macro-F1')
-    plt.title(f'{args.cancer} — All seeds F1 curves')
+    plt.ylabel('Val Macro-F1')
+    plt.title(f'{args.cancer} — All seeds Val F1 curves')
     plt.legend(fontsize=9)
     plt.tight_layout()
 
@@ -245,13 +267,14 @@ if __name__ == "__main__":
                                 f"f1_curve_{args.cancer}_all_seeds.png")
     plt.savefig(summary_plot, dpi=120)
     plt.close()
-    print(f"\n  → Summary F1 curve saved: {summary_plot}")
-    # ────────────────────────────────────────────────────────────────────
+    print(f"\n  → Summary val F1 curve saved: {summary_plot}")
 
-    # ── ENSEMBLE ────────────────────────────────────────────────────────
-    print("\n" + "="*50)
-    print("  FINAL ENSEMBLE RESULT")
-    print("="*50)
+    # ── ENSEMBLE ─────────────────────────────────────────────────────────
+    # Cross-seed ensemble: average logits from last 10 epochs of each seed.
+    # Evaluated ONLY on test_mask (not used during training at all).
+    print("\n" + "=" * 55)
+    print("  FINAL ENSEMBLE RESULT (test set — never seen during training)")
+    print("=" * 55)
 
     ensemble = torch.stack(all_logits).mean(dim=0)  # [N, C]
     pred     = ensemble.argmax(dim=1)
