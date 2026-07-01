@@ -1,5 +1,6 @@
 ﻿#  读取.pth文件中，每个特征的系数，然后把他们放到一个字典里，key是特征名，value是系数。
 import os
+import glob   # thêm dòng này cạnh import os, torch ở đầu file
 import torch
 import matplotlib.pyplot as plt
 import json
@@ -22,47 +23,57 @@ from matplotlib.ticker import FormatStrFormatter
 # The old read_pth_file() is kept below for reference / old checkpoints.
 # ─────────────────────────────────────────────────────────────────
 
-def read_new_model_attn(pth_file_path, pth_file_name):
+def read_new_model_attn(pth_file_path, pth_file_name_or_pattern):
     """
-    Load attention weights from a NEW model checkpoint
-    (LightGATEncoder + AttentionFusion, saved by main.py).
+    FIX: gộp được NHIỀU checkpoint (5 init seed của cùng 1 config) thay vì
+    chỉ đọc đúng 1 file — vẽ attention từ 1 seed bất kỳ yếu về thống kê,
+    nên cũng nên báo cáo mean qua nhiều seed như các bảng macro-F1 trước đó.
 
-    Checkpoint keys saved by main.py:
-        'epoch'             : int
-        'model_state_dict'  : OrderedDict
-        'f1'                : float
-        'acc'               : float
-        'args'              : dict
-        'attention_weights' : Tensor [N, 4]   ← omics attention per sample
-        'y'                 : Tensor [N]       ← true labels
-        'omics_names'       : list of 4 str   ← ['mRNA','miRNA','Methy','CNV']
-
-    Returns
-    -------
-    attn_dict : dict with keys:
-        'weights'      : np.ndarray [N, 4]  — per-sample attention weights
-        'omics_names'  : list[str]          — ['mRNA', 'miRNA', 'Methy', 'CNV']
-        'y'            : np.ndarray [N]     — true labels
-        'mean_weights' : np.ndarray [4]     — mean attention per omics (for bar plot)
-        'f1'           : float
-        'acc'          : float
-        'epoch'        : int
+    pth_file_name_or_pattern:
+      - tên file cụ thể, vd 'BRCA_gat_attn_s0_seed42_best.pth' → đọc 1 file
+      - pattern glob, vd    'BRCA_gat_attn_s0_seed*_best.pth' → gộp 5 seed
     """
-    full_path = os.path.join(pth_file_path, pth_file_name)
-    content = torch.load(full_path, weights_only=False)
+    pattern = os.path.join(pth_file_path, pth_file_name_or_pattern)
+    is_glob = any(c in pth_file_name_or_pattern for c in "*?[")
+    paths = sorted(glob.glob(pattern)) if is_glob else [pattern]
 
-    weights     = content['attention_weights'].numpy()   # [N, 4]
-    omics_names = content['omics_names']                 # ['mRNA','miRNA','Methy','CNV']
-    y           = content['y'].numpy()                   # [N]
+    if not paths:
+        raise FileNotFoundError(f"Không tìm thấy checkpoint khớp: {pattern}")
 
+    all_weights = []
+    y_ref       = None
+    fusion_mode = None
+    val_f1_list = []
+
+    for p in paths:
+        content = torch.load(p, weights_only=False)
+
+        if 'attention_weights' not in content:
+            raise KeyError(
+                f"'{os.path.basename(p)}' không chứa 'attention_weights'. "
+                f"Checkpoint train trước khi main.py được sửa — chạy lại "
+                f"bằng run_top_configs.ps1 (đã cập nhật)."
+            )
+        all_weights.append(content['attention_weights'].numpy())
+
+        if y_ref is None:
+            y_ref = content['y'].numpy()
+        fusion_mode = content.get('args', {}).get('fusion', fusion_mode or 'attn')
+        if 'val_f1' in content:
+            val_f1_list.append(content['val_f1'])
+
+    weights = np.mean(all_weights, axis=0)   # [N, 4], gộp qua các init seed
+
+    omics_names = ['mRNA', 'miRNA', 'Methy', 'CNV']
     return {
-        'weights':      weights,
-        'omics_names':  omics_names,
-        'y':            y,
-        'mean_weights': weights.mean(axis=0),            # [4] — avg omics importance
-        'f1':           content.get('f1',  None),
-        'acc':          content.get('acc', None),
-        'epoch':        content.get('epoch', None),
+        'weights':       weights,
+        'omics_names':   omics_names,
+        'mean_weights':  weights.mean(axis=0),
+        'y':             y_ref,
+        'fusion_mode':   fusion_mode,
+        'n_checkpoints': len(paths),
+        'f1':            float(np.mean(val_f1_list)) if val_f1_list else None,
+        'acc':           None,
     }
 
 
@@ -277,20 +288,17 @@ def draw_feature_importance_bar(feature_coefficient_dict, disease):
 # ─────────────────────────────────────────────────────────────────
 def draw_omics_attention_bar(attn_dict, disease, save_dir='./Result/pic'):
     """
-    Draw a bar chart showing mean attention weight per omics modality.
-
-    Parameters
-    ----------
-    attn_dict   : dict returned by read_new_model_attn()
-    disease     : str, e.g. 'BRCA'
-    save_dir    : str, directory to save the SVG
+    FIX: tự đổi nhãn theo fusion_mode lấy từ checkpoint, tránh gọi sai
+    "attention weight" cho model fusion=cross (vốn không có attention thật).
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    omics_names  = attn_dict['omics_names']   # ['mRNA', 'miRNA', 'Methy', 'CNV']
-    mean_weights = attn_dict['mean_weights']  # [4]
-    weights      = attn_dict['weights']       # [N, 4]
-    std_weights  = weights.std(axis=0)        # [4]
+    omics_names  = attn_dict['omics_names']
+    mean_weights = attn_dict['mean_weights']
+    weights      = attn_dict['weights']
+    std_weights  = weights.std(axis=0)
+    fusion_mode  = attn_dict.get('fusion_mode', 'attn')
+    n_ckpt       = attn_dict.get('n_checkpoints', 1)
 
     colors = [
         (241/255, 157/255, 145/255),
@@ -306,21 +314,27 @@ def draw_omics_attention_bar(attn_dict, disease, save_dir='./Result/pic'):
 
     ax.set_xticks(x)
     ax.set_xticklabels(omics_names, fontsize=12)
-    ax.set_ylabel('Mean Attention Weight', fontsize=12)
-    ax.set_title(f'{disease} — Omics Attention (LightGATEncoder)', fontsize=12)
+
+    if fusion_mode == 'cross':
+        ax.set_ylabel('Mean Per-Omic Head Confidence', fontsize=12)
+        ax.set_title(f'{disease} — Omic Head Confidence (CrossOmicsFusion, '
+                     f'KHÔNG phải attention, n={n_ckpt} seed)', fontsize=10)
+    else:
+        ax.set_ylabel('Mean Attention Weight', fontsize=12)
+        ax.set_title(f'{disease} — Omics Attention (AttentionFusion, '
+                     f'n={n_ckpt} seed)', fontsize=12)
+
     ax.tick_params(axis='y', labelsize=10)
 
-    # Annotate each bar with its mean value
     for bar, val in zip(bars, mean_weights):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.003,
                 f'{val:.3f}', ha='center', va='bottom', fontsize=9)
 
     plt.tight_layout()
-    save_path = os.path.join(save_dir, f'omics_attention_{disease}.svg')
+    save_path = os.path.join(save_dir, f'omics_attention_{disease}_{fusion_mode}.svg')
     plt.savefig(save_path, format='svg', bbox_inches='tight')
     plt.show()
     print(f'Saved: {save_path}')
-
 
 # 定义一个函数来生成满足特定平均值和方差要求的5个数
 def generate_numbers_with_mean_and_std(mean, std_dev, tolerance=0.001):
@@ -630,45 +644,13 @@ def draw_zhuzhuangtu_sandiantu(disease, pooling_ceng):
 
 
 if __name__ == '__main__':
-
-    draw_new_model_attn = True          # ← đảm bảo là True
-
+    draw_new_model_attn = True
     pth_file_path = r'E:\Cancer-classification-dataset\checkpoints'
-
-    test_pth_file_name = 'BRCA_seed777_best.pth'   # ← SỬA DÒNG NÀY
-
     disease = 'BRCA'
 
-    # ─────────────────────────────────────────────────────────────
-    # To visualize omics attention from the NEW model checkpoints,
-    # set draw_new_model_attn = True and provide the checkpoint path.
-    # Example:
-    #   ckpt_dir  = r'E:\Cancer-classification-dataset\checkpoints'
-    #   ckpt_name = 'BRCA_seed777_best.pth'
-    #   attn_dict = read_new_model_attn(ckpt_dir, ckpt_name)
-    #   draw_omics_attention_bar(attn_dict, 'BRCA')
-    # ─────────────────────────────────────────────────────────────
-
-    num_pool = 2
+    # Pattern khớp cả 5 init seed của config tốt nhất (gat/attn/lr=5e-4/mixup=0.0)
+    test_pth_file_name = 'BRCA_gat_attn_s0_seed*_best.pth'
 
     if draw_new_model_attn:
-        # Use this block for NEW model (LightGATEncoder) checkpoints
         attn_dict = read_new_model_attn(pth_file_path, test_pth_file_name)
         draw_omics_attention_bar(attn_dict, disease)
-    else:
-        # Use this block for OLD model (HGPSLPool) checkpoints only
-        feature_coefficient_dict = {}
-        feature_coefficient_dict = read_pth_file(pth_file_path, test_pth_file_name, num_pool, feature_coefficient_dict)
-        if out_file:
-            # with open('./特征重要性/{}/{}_feature_coefficient_dict.txt'.format(disease, disease), 'w') as f:
-            #     f.write(str(feature_coefficient_dict))
-
-            # 将字典保存为 JSON 格式的文件
-            with open('./特征重要性/{}/{}_feature_coefficient_dict.json'.format(disease, disease), 'w') as f:
-                json.dump(feature_coefficient_dict, f, indent=4)
-        if draw_fea_imp_bar:  # 应该是弃用了，老师不是这个意思
-            draw_feature_importance_bar(feature_coefficient_dict, disease)
-        if draw_result:
-            draw_result_bar()
-        if draw_zhuzhuang_sandian:
-            draw_zhuzhuangtu_sandiantu(disease, pooling_ceng)

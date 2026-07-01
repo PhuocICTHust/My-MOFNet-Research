@@ -20,79 +20,103 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--cancer",         required=True,
                     choices=["BRCA", "COAD", "GBM", "LGG", "OV"])
 parser.add_argument("--data_path",      required=True)
+# FIX P3 (loader side): load the split-tagged graph file.
+parser.add_argument("--split_seed",     type=int,   default=777,
+                    help="Identifies which graph file to load: "
+                         "{cancer}_graph_s{split_seed}.pt. Vary across runs "
+                         "(e.g. 0..4) for repeated stratified CV; report mean ± std "
+                         "of the per-split test scores.")
 parser.add_argument("--epochs",         type=int,   default=200,
                     help="Max epochs — early stopping handles actual termination.")
 parser.add_argument("--nhid",           type=int,   default=64)
+# PATCH 1: GAT-vs-GCN ablation switch. Run both, report both columns.
+parser.add_argument("--conv_type",      choices=["gat", "gcn"], default="gat",
+                    help="Graph encoder. 'gat'=attention (default); "
+                         "'gcn'=lighter, ~50%% fewer params (often better on the "
+                         "smallest cohorts GBM/OV/COAD). Run both for the ablation.")
+# PATCH 2: fusion mechanism. 'attn'=soft attention (≈ paper's MVA ablation);
+# 'cross'=VCDN-lite pairwise label-space fusion (targets the MVA→full-MOFNet gap).
+parser.add_argument("--fusion",         choices=["attn", "cross"], default="attn",
+                    help="Omics fusion. 'attn'=soft attention weighted-sum "
+                         "(default, stable baseline); 'cross'=lightweight "
+                         "cross-omics label fusion (validate per-cohort; can "
+                         "overfit COAD/GBM).")
 parser.add_argument("--num_classes",    type=int,   default=0)
 parser.add_argument("--dropout_ratio",  type=float, default=0.3)
 parser.add_argument("--lr",             type=float, default=5e-4)
 parser.add_argument("--weight_decay",   type=float, default=5e-4)
 parser.add_argument("--focal_gamma",    type=float, default=2.0)
 parser.add_argument("--entropy_weight", type=float, default=0.01)
+# Registered so getattr(args,"attention_temp") is actually configurable
+# (previously dead config: temperature was always 1.0).
+parser.add_argument("--attention_temp", type=float, default=1.0,
+                    help="Softmax temperature for the modality fusion gate.")
 
 # ── FIX A: Linear warmup before cosine decay ─────────────────────────────
-# Prevents the sharp LR drop at epoch 0 that caused GBM/OV instability:
-# ep-0 val F1 ranged from 0.19-0.48 (0.29-unit spread), implying noisy
-# gradient directions at high LR. Warmup lifts start_factor to 0.1*lr=5e-5,
-# ramps linearly to lr over --warmup_epochs, then hands off to cosine.
-# Cost: ~0 (just a scheduler change). Gain: ~0.01-0.03 reduction in seed variance.
 parser.add_argument("--warmup_epochs",  type=int,   default=10,
                     help="Linear LR warmup epochs before cosine decay. 0 = disabled.")
 
 # ── FIX B: Early stopping ────────────────────────────────────────────────
-# Without early stopping, the last-10-epoch ensemble windows were collected
-# at epochs 140-149 regardless of whether the model had already peaked.
-# For LGG, best val F1 was reached at epoch 40; collecting ep 140-149
-# adds noise from near-zero LR epochs. With patience=40, training halts
-# automatically and the ensemble is tighter around the best checkpoint.
-# Exception: small val sets (LGG val=25) can plateau early due to ceiling
-# effects — use patience>=40 to avoid premature stopping there.
 parser.add_argument("--patience",       type=int,   default=40,
                     help="Early stopping patience on val F1. 0 = disabled.")
 
 # ── FIX C: Label smoothing ───────────────────────────────────────────────
-# BRCA val F1 oscillated ±0.06 between epochs (0.786→0.700→0.756→0.722...)
-# even with CosineAnnealingLR at low LR. The cause: hard 0/1 labels cause
-# the model to push logit gaps to extremes, making it sensitive to small
-# perturbations. Label smoothing (ε=0.05) softens targets to ε/(C-1) for
-# non-target classes, stabilising the gradient norm.
 parser.add_argument("--label_smoothing", type=float, default=0.05,
                     help="Label smoothing ε for FocalLoss. 0 = disabled.")
 
-# ── FIX D: Best-checkpoint ensemble ─────────────────────────────────────
-# Original: ensemble = mean of last-10-epoch logits from all 5 seeds.
-# Problem: epoch T-9 through T may include training noise if LR is still
-# meaningful, OR if early stopping fires at different epochs per seed, the
-# window sizes become inconsistent.
-# New: after all seeds, reload each seed's best-val-F1 checkpoint and
-# run a single inference pass. Ensemble = mean of 5 best-checkpoint logits.
-# Strictly ≥ original (never worse), typically +0.005-0.02 macro-F1.
+# ── FIX D: Best-checkpoint ensemble ──────────────────────────────────────
+# Now ALWAYS on. The previous last-10-epoch fallback required scoring the test
+# set every epoch, which invites researcher-degrees-of-freedom leakage. Test
+# is now touched exactly once: at the end, from the best-val-F1 checkpoints.
 parser.add_argument("--use_best_ensemble", action="store_true",
-                    help="Ensemble from saved best-val-F1 checkpoints (recommended).")
+                    help="(Retained for CLI compatibility; ensemble is always "
+                         "built from best-val-F1 checkpoints now.)")
 
 # ── FIX E: Feature MixUp ────────────────────────────────────────────────
-# Interpolates training-node features between random pairs in each batch.
 # Mixed loss: λ·L(f(x̃), yₐ) + (1-λ)·L(f(x̃), y_b), λ ~ Beta(α,α).
-# Reduces GBM class-4 recall (0.33 in original) by smoothing decision
-# boundaries near minority-class nodes. Disable with --mixup_alpha 0.
+# NOTE (FIX A2): the cross-label term is now scored against the SAME mixed
+# predictions (see train()). The original code indexed logits[perm], which made
+# focal_b numerically identical to focal_a → MixUp collapsed to a no-op.
 parser.add_argument("--mixup_alpha",    type=float, default=0.2,
-                    help="MixUp Beta parameter for feature interpolation. 0 = disabled.")
+                    help="MixUp Beta parameter for feature interpolation. 0 = disabled. "
+                         "Consider 0.1 to protect tiny minority classes.")
 
 args = parser.parse_args()
 
 
 # ─────────────────────────────
-# SEED
+# SEED  (FIX A4: determinism)
 # ─────────────────────────────
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def load_graph():
-    path = os.path.join(args.data_path, f"{args.cancer}_graph.pt")
+    # FIX P3: split-tagged filename, with backward-compatible fallback.
+    tagged = os.path.join(args.data_path, f"{args.cancer}_graph_s{args.split_seed}.pt")
+    legacy = os.path.join(args.data_path, f"{args.cancer}_graph.pt")
+    path = tagged if os.path.exists(tagged) else legacy
+
+    # FIX (diagnostics): the previous version let torch.load() raise its bare
+    # FileNotFoundError on the legacy path, which looks identical whether the
+    # cause was "wrong split_seed", "prepare_graph.py never ran", or
+    # "prepare_graph.py crashed silently upstream". State both paths that were
+    # tried so the next failure is diagnosable in one glance, no detective work.
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"No graph file found for cancer={args.cancer}, split_seed={args.split_seed}.\n"
+            f"  Tried (tagged): {tagged}\n"
+            f"  Tried (legacy): {legacy}\n"
+            f"  -> Run: python scripts/prepare_graph.py --cancer {args.cancer} "
+            f"--split_seed {args.split_seed}\n"
+            f"     and confirm it actually prints '... DONE! Saved to: ...' "
+            f"(check exit code / log if run from a script)."
+        )
     return torch.load(path, weights_only=False)
 
 
@@ -110,9 +134,9 @@ def train(model, data, optimizer, criterion, mask):
 
     if args.mixup_alpha > 0:
         # ── Feature-space MixUp on training nodes only ───────────────────
-        # Interpolate features of randomly-paired training nodes.
-        # Graph topology is unchanged; only node features are mixed.
-        # Loss is the convex combination of the two constituent class losses.
+        # Interpolate features of randomly-paired training nodes. Graph
+        # topology is unchanged; only node features are mixed. Loss is the
+        # convex combination of the two constituent class losses.
         train_idx = mask_dev.nonzero(as_tuple=True)[0]
         n         = len(train_idx)
         perm      = train_idx[torch.randperm(n, device=device)]
@@ -130,9 +154,11 @@ def train(model, data, optimizer, criterion, mask):
         for key, d in [('mRNA', d1), ('miRNA', d2), ('Methy', d3), ('CNV', d4)]:
             d.x[train_idx] = saved[key]
 
-        # λ·L(ŷ, yₐ) + (1-λ)·L(ŷ, y_b)
+        # FIX A2: both terms use the SAME mixed predictions logits[train_idx];
+        # only the labels differ (yₐ vs y_b). The original logits[perm] made
+        # focal_b ≡ focal_a, nullifying the cross-label MixUp signal.
         focal_a    = criterion(logits[train_idx], y_dev[train_idx])
-        focal_b    = criterion(logits[perm],      y_dev[perm])
+        focal_b    = criterion(logits[train_idx], y_dev[perm])
         focal_loss = lam * focal_a + (1 - lam) * focal_b
     else:
         logits, entropy = model(d1, d2, d3, d4)
@@ -164,11 +190,11 @@ def evaluate(model, data, mask):
 
 
 # ─────────────────────────────
-# RUN ONE SEED
+# RUN ONE SEED  (model-init variance; data split is fixed by split_seed)
 # ─────────────────────────────
 def run_one_seed(seed):
     print(f"\n{'='*50}")
-    print(f"  Seed {seed}")
+    print(f"  Init seed {seed}  (split_seed={args.split_seed})")
     print(f"{'='*50}")
     set_seed(seed)
 
@@ -180,12 +206,19 @@ def run_one_seed(seed):
 
     model = PanCancerModel(args, data).to(device)
 
-    y_np    = data["mRNA"].y.cpu().numpy()
-    classes = np.unique(y_np)
-    w       = compute_class_weight("balanced", classes=classes, y=y_np)
-    w       = np.clip(w, 0.5, 5.0)
-    w_t     = torch.tensor(w, dtype=torch.float32).to(device)
-    print(f"  Class weights (clamped): {np.round(w, 4)}")
+    # ── FIX A1: class weights from TRAIN labels only (no val/test leakage) ──
+    y_full        = data["mRNA"].y.cpu().numpy()
+    train_mask_np = data["mRNA"].train_mask.cpu().numpy()
+    y_train       = y_full[train_mask_np]
+    classes       = np.unique(y_full)            # full set → stable weight length
+    present       = np.unique(y_train)
+    w_present     = compute_class_weight("balanced", classes=present, y=y_train)
+    w             = np.ones(len(classes), dtype=np.float64)
+    for c, wc in zip(present, w_present):
+        w[c] = wc
+    w   = np.clip(w, 0.5, 5.0)
+    w_t = torch.tensor(w, dtype=torch.float32).to(device)
+    print(f"  Class weights (train-only, clamped): {np.round(w, 4)}")
 
     criterion = FocalLoss(gamma=args.focal_gamma, alpha=w_t,
                           label_smoothing=args.label_smoothing)
@@ -206,17 +239,18 @@ def run_one_seed(seed):
 
     train_mask = data["mRNA"].train_mask.to(device)
     val_mask   = data["mRNA"].val_mask.to(device)
-    test_mask  = data["mRNA"].test_mask.to(device)
 
     best_val_f1    = 0.0
     patience_ctr   = 0
     best_epoch     = 0
-    last_k_logits  = []
     val_f1_history = []
 
     ckpt_dir  = os.path.join(args.data_path, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
-    ckpt_path = os.path.join(ckpt_dir, f"{args.cancer}_seed{seed}_best.pth")
+    # Tag with conv_type + fusion so GAT/GCN × attn/cross runs never collide.
+    ckpt_path = os.path.join(
+        ckpt_dir,
+        f"{args.cancer}_{args.conv_type}_{args.fusion}_s{args.split_seed}_seed{seed}_best.pth")
 
     neg_loss_warned = False
 
@@ -224,33 +258,45 @@ def run_one_seed(seed):
         loss, focal = train(model, data, optimizer, criterion, train_mask)
         scheduler.step()
 
-        # ── FIX A note: total loss can go negative when entropy is near
-        # its maximum (log(4) ≈ 1.39 for 4 modalities) and focal is tiny.
-        # This is the entropy regularisation working as intended — it is NOT
-        # a training failure. Track focal_loss separately for convergence.
+        # Total loss can go negative when entropy is near maximum (log(4)≈1.39)
+        # and focal is tiny. NOTE: this is also a sign that TRAIN focal has been
+        # driven near zero (focal < entropy_weight·entropy ⇒ focal < ~0.014),
+        # i.e. an overfitting indicator in this small-N regime — not just a
+        # benign artefact. Selection is on val F1, so it does not corrupt
+        # model choice, but treat persistent negative loss as a cue to add
+        # regularisation rather than to ignore.
         if loss < 0 and not neg_loss_warned:
             print(f"  [ep {epoch}] Total loss negative (focal={focal:.4f}): "
-                  f"entropy near maximum, fusion weights are near-uniform. "
-                  f"This is expected and harmless.")
+                  f"entropy near max / train focal near zero — watch for overfitting.")
             neg_loss_warned = True
 
-        val_acc,  val_f1,  _,          _    = evaluate(model, data, val_mask)
-        test_acc, test_f1, logits_cpu,  attn = evaluate(model, data, test_mask)
+        # FIX A3: select on VAL only. Test is NOT scored inside the loop, to
+        # avoid surfacing test F1 every epoch (a researcher-leakage channel).
+        # FIX P4: evaluate() already computes model.get_attention_weights()
+        # internally (a full-graph forward pass, so it covers ALL N patients,
+        # not just val) — it was just being discarded with "_". Capture it so
+        # the checkpoint below can save it for interpretability plots.
+        val_acc, val_f1, _, val_attn = evaluate(model, data, val_mask)
         val_f1_history.append(val_f1)
 
         if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            best_epoch  = epoch
+            best_val_f1  = val_f1
+            best_epoch   = epoch
             patience_ctr = 0
             torch.save({
                 'epoch':             epoch,
                 'model_state_dict':  model.state_dict(),
                 'val_f1':            val_f1,
-                'test_f1':           test_f1,
                 'args':              vars(args),
-                'attention_weights': attn,
                 'y':                 data['mRNA'].y.cpu(),
                 'omics_names':       ['mRNA', 'miRNA', 'Methy', 'CNV'],
+                # FIX P4: per-patient [N,4] weights for the interpretability
+                # plot. CAUTION when args.fusion == "cross": CrossOmicsFusion
+                # does not have real attention — this is a mean per-omic head
+                # confidence proxy (see models.py docstring), not a learned
+                # fusion weight. visualize_attention.py reads args['fusion']
+                # from this same checkpoint to label the chart correctly.
+                'attention_weights': val_attn,
             }, ckpt_path)
         else:
             patience_ctr += 1
@@ -261,18 +307,12 @@ def run_one_seed(seed):
                   f"(best val F1={best_val_f1:.4f} @ ep {best_epoch})")
             break
 
-        # Collect last-K logits as fallback ensemble (if use_best_ensemble=False)
-        if epoch >= args.epochs - 10:
-            last_k_logits.append(logits_cpu)
-
         if epoch % 10 == 0:
             lr_now = scheduler.get_last_lr()[0]
             print(f"  Ep {epoch:3d} | loss={loss:.4f} focal={focal:.4f} | "
-                  f"val_acc={val_acc:.4f} val_F1={val_f1:.4f} | "
-                  f"test_acc={test_acc:.4f} test_F1={test_f1:.4f} | "
-                  f"lr={lr_now:.2e}")
+                  f"val_acc={val_acc:.4f} val_F1={val_f1:.4f} | lr={lr_now:.2e}")
 
-    print(f"  → Best val macro-F1 (seed {seed}): {best_val_f1:.4f} @ epoch {best_epoch}")
+    print(f"  → Best val macro-F1 (init seed {seed}): {best_val_f1:.4f} @ epoch {best_epoch}")
     print(f"  → Checkpoint: {ckpt_path}")
 
     # ── Val F1 curve ──────────────────────────────────────────────────────
@@ -282,18 +322,16 @@ def run_one_seed(seed):
                 label=f'Best epoch {best_epoch} (val F1={best_val_f1:.4f})')
     plt.xlabel('Epoch')
     plt.ylabel('Val Macro-F1')
-    plt.title(f'{args.cancer} — Seed {seed} (val)')
+    plt.title(f'{args.cancer} (split {args.split_seed}) — init seed {seed}')
     plt.legend(fontsize=9)
     plt.tight_layout()
     plot_path = os.path.join(args.data_path,
-                             f"f1_curve_{args.cancer}_seed{seed}.png")
+                             f"f1_curve_{args.cancer}_{args.conv_type}_{args.fusion}_s{args.split_seed}_seed{seed}.png")
     plt.savefig(plot_path, dpi=120)
     plt.close()
     print(f"  → Val F1 curve: {plot_path}")
 
-    ensemble_logits = (torch.stack(last_k_logits).mean(dim=0)
-                       if last_k_logits else logits_cpu)
-    return ensemble_logits, data, val_f1_history
+    return data, val_f1_history
 
 
 # ─────────────────────────────
@@ -307,39 +345,39 @@ if __name__ == "__main__":
         del _tmp
 
     print(f"\n  Cancer      : {args.cancer}")
+    print(f"  split_seed  : {args.split_seed}  (data split fixed by this)")
     print(f"  num_classes : {args.num_classes}  (BRCA/GBM=5, COAD/OV=4, LGG=3)")
     print(f"  warmup      : {args.warmup_epochs} epochs")
     print(f"  patience    : {args.patience}")
     print(f"  label_smth  : {args.label_smoothing}")
     print(f"  mixup_alpha : {args.mixup_alpha}")
-    print(f"  ensemble    : {'best-checkpoint' if args.use_best_ensemble else 'last-10-epoch'}")
+    print(f"  conv_type   : {args.conv_type}")
+    print(f"  fusion      : {args.fusion}")
+    print(f"  ensemble    : best-checkpoint (always)")
 
+    # These vary weight init / dropout / mixup RNG only — the DATA SPLIT is
+    # fixed by --split_seed. For honest small-N variance, sweep --split_seed
+    # (e.g. 0..4) across separate runs and aggregate the per-split test scores.
     seeds         = [777, 42, 1234, 2024, 999]
-    all_logits    = []
     all_f1_curves = []
     final_data    = None
     final_device  = None
 
     for s in seeds:
-        logits, data, f1_hist = run_one_seed(s)
-        all_logits.append(logits)
+        data, f1_hist = run_one_seed(s)
         all_f1_curves.append(f1_hist)
         final_data   = data
         final_device = next(iter(data.values())).x.device
 
-# ── Summary val F1 plot ───────────────────────────────────────────────
+    # ── Summary val F1 plot ───────────────────────────────────────────────
     plt.figure(figsize=(10, 5))
     colors = ['steelblue', 'darkorange', 'seagreen', 'mediumpurple', 'crimson']
     for idx, (hist, seed) in enumerate(zip(all_f1_curves, seeds)):
         plt.plot(hist, linewidth=1.2, alpha=0.8,
-                 color=colors[idx], label=f'Seed {seed}')
+                 color=colors[idx], label=f'Init seed {seed}')
     max_len = max(len(c) for c in all_f1_curves)
 
-    arr = np.full(
-        (len(all_f1_curves), max_len),
-        np.nan
-    )
-
+    arr = np.full((len(all_f1_curves), max_len), np.nan)
     for i, curve in enumerate(all_f1_curves):
         arr[i, :len(curve)] = curve
 
@@ -348,65 +386,64 @@ if __name__ == "__main__":
              linestyle='--', label='Mean')
     plt.xlabel('Epoch')
     plt.ylabel('Val Macro-F1')
-    plt.title(f'{args.cancer} — All seeds Val F1 curves')
+    plt.title(f'{args.cancer} (split {args.split_seed}) — all init seeds')
     plt.legend(fontsize=9)
     plt.tight_layout()
     summary_plot = os.path.join(args.data_path,
-                                f"f1_curve_{args.cancer}_all_seeds.png")
+                                f"f1_curve_{args.cancer}_{args.conv_type}_{args.fusion}_s{args.split_seed}_all_seeds.png")
     plt.savefig(summary_plot, dpi=120)
     plt.close()
     print(f"\n  → Summary val F1 curve: {summary_plot}")
 
-    # ── FIX D: Best-checkpoint ensemble ──────────────────────────────────
+    # ── FIX D + A3: Best-checkpoint ensemble (test touched exactly once) ──
     ckpt_dir = os.path.join(args.data_path, "checkpoints")
     device   = final_device
 
-    if args.use_best_ensemble:
-        print("\n  Loading best checkpoints for ensemble...")
-        best_ckpt_logits = []
-        for seed in seeds:
-            ckpt_path = os.path.join(ckpt_dir,
-                                     f"{args.cancer}_seed{seed}_best.pth")
-            if not os.path.exists(ckpt_path):
-                print(f"  ⚠  Checkpoint not found for seed {seed}, skipping.")
-                continue
-            ckpt = torch.load(ckpt_path, weights_only=False)
-            model_tmp = PanCancerModel(args, final_data).to(device)
-            model_tmp.load_state_dict(ckpt['model_state_dict'])
-            _, _, logits_cpu, _ = evaluate(model_tmp,
-                                           final_data,
-                                           final_data["mRNA"].test_mask)
-            best_ckpt_logits.append(logits_cpu)
-            print(f"    Seed {seed}: best ep={ckpt.get('epoch','?')}, "
-                  f"val_F1={ckpt.get('val_f1', float('nan')):.4f}")
-        ensemble = torch.stack(best_ckpt_logits).mean(dim=0)
-    else:
-        ensemble = torch.stack(all_logits).mean(dim=0)
+    print("\n  Loading best-val checkpoints for ensemble...")
+    best_ckpt_logits = []
+    for seed in seeds:
+        ckpt_path = os.path.join(
+            ckpt_dir,
+            f"{args.cancer}_{args.conv_type}_{args.fusion}_s{args.split_seed}_seed{seed}_best.pth")
+        if not os.path.exists(ckpt_path):
+            print(f"  ⚠  Checkpoint not found for init seed {seed}, skipping.")
+            continue
+        ckpt = torch.load(ckpt_path, weights_only=False)
+        model_tmp = PanCancerModel(args, final_data).to(device)
+        model_tmp.load_state_dict(ckpt['model_state_dict'])
+        _, _, logits_cpu, _ = evaluate(model_tmp, final_data,
+                                       final_data["mRNA"].test_mask)
+        best_ckpt_logits.append(logits_cpu)
+        print(f"    Init seed {seed}: best ep={ckpt.get('epoch','?')}, "
+              f"val_F1={ckpt.get('val_f1', float('nan')):.4f}")
 
-    pred = ensemble.argmax(dim=1)
+    if not best_ckpt_logits:
+        raise RuntimeError("No checkpoints found — cannot build ensemble.")
+
+    ensemble = torch.stack(best_ckpt_logits).mean(dim=0)
+    pred     = ensemble.argmax(dim=1)
 
     y    = final_data["mRNA"].y.cpu()
     mask = final_data["mRNA"].test_mask.cpu()
 
-    acc          = accuracy_score(y[mask], pred[mask])
-    y_arr        = y[mask].numpy()
-    pred_arr     = pred[mask].numpy()
-    f1_macro     = f1_score(y_arr, pred_arr, average="macro",    zero_division=0)
-    f1_weighted  = f1_score(y_arr, pred_arr, average="weighted", zero_division=0)
+    acc         = accuracy_score(y[mask], pred[mask])
+    y_arr       = y[mask].numpy()
+    pred_arr    = pred[mask].numpy()
+    f1_macro    = f1_score(y_arr, pred_arr, average="macro",    zero_division=0)
+    f1_weighted = f1_score(y_arr, pred_arr, average="weighted", zero_division=0)
 
-    counts_test  = np.bincount(y_arr, minlength=args.num_classes)
-    min_tc       = int(counts_test.min())
+    counts_test = np.bincount(y_arr, minlength=args.num_classes)
+    min_tc      = int(counts_test.min())
 
     print("\n" + "=" * 57)
     print("  FINAL ENSEMBLE RESULT (test set — never seen during training)")
+    print(f"  (split_seed={args.split_seed})")
     print("=" * 57)
     print(f"  Accuracy    : {acc:.4f}")
     print(f"  Macro-F1    : {f1_macro:.4f}")
 
-    # ── FIX: Flag when macro-F1 is misleading due to tiny test classes ───
-    # COAD class-3 has N=4 total → N=1 test sample → F1=0.00 regardless.
-    # That single zero drags macro-F1 from ~0.73 to ~0.53.
-    # Report weighted-F1 alongside when this situation is detected.
+    # When a test class has ≤2 samples, macro-F1 is dominated by a coin flip on
+    # one or two points; report weighted-F1 as the fair comparison metric.
     if min_tc < 3:
         print(f"  Weighted-F1 : {f1_weighted:.4f}  "
               f"<-- preferred metric (min test-class count = {min_tc})")
@@ -424,7 +461,7 @@ if __name__ == "__main__":
                                 target_names=cls_names, zero_division=0))
 
     csv_path = os.path.join(args.data_path,
-                            f"{args.cancer}_ensemble_predictions.csv")
+                            f"{args.cancer}_{args.conv_type}_{args.fusion}_s{args.split_seed}_ensemble_predictions.csv")
     pd.DataFrame({
         'true_label': y_arr,
         'pred_label': pred_arr,
